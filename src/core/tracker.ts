@@ -2,6 +2,7 @@ import axios from 'axios';
 import bencode from 'bencode';
 import dgram from 'dgram';
 import crypto from 'crypto';
+import dns from 'dns';
 
 interface Torrent {
     announce: string | string[];
@@ -25,57 +26,93 @@ const ACTIONS = {
     ERROR: 3
 };
 
+// Additional list of reliable public trackers
+const FALLBACK_TRACKERS = [
+    'udp://tracker.openbittorrent.com:6969',
+    'udp://open.demonii.com:1337/announce',
+    'udp://tracker.opentrackr.org:1337/announce',
+    'http://tracker.ipv6tracker.org:80/announce',
+    'http://tracker.internetwarriors.net:1337/announce'
+];
+
 export function connectToTrackers(torrent: Torrent, callback: (peers: Peer[]) => void) {
-    // Combine multiple tracker sources
+    // Combine multiple tracker sources with fallback trackers
     const trackerSources = [
         ...(Array.isArray(torrent.announce) ? torrent.announce : [torrent.announce]),
-        // Additional public trackers
-        'udp://tracker.opentrackr.org:1337/announce',
-        'udp://tracker.coppersphere.org:6969/announce',
-        'udp://tracker.cyberia.is:6969/announce',
-        'http://tracker.ipv6tracker.org:80/announce'
+        ...FALLBACK_TRACKERS
     ];
 
-    // Remove duplicates and filter valid URLs
-    const uniqueTrackers = [...new Set(trackerSources)]
-        .filter(url => url.startsWith('http://') || url.startsWith('https://') || url.startsWith('udp://'));
+    // Validate and filter trackers with DNS resolution
+    const validateTracker = (trackerUrl: string): Promise<string | null> => {
+        return new Promise((resolve) => {
+            const parsedUrl = new URL(trackerUrl);
+            const host = parsedUrl.hostname;
 
-    const infoHash = Buffer.from(torrent.infoHash, 'hex');
-    const peerId = Buffer.from('-TS0001-' + Math.random().toString(36).slice(2, 12));
-    
-    let peerList: Peer[] = [];
-    let pendingTrackers = uniqueTrackers.length;
-
-    if (pendingTrackers === 0) {
-        console.log("No valid trackers found.");
-        return callback([]);
-    }
-
-    // Track which trackers have been fully processed
-    const processTracker = (trackerPeers: Peer[]) => {
-        peerList = peerList.concat(trackerPeers);
-        pendingTrackers--;
-
-        if (pendingTrackers === 0) {
-            console.log(`Total peers discovered: ${peerList.length}`);
-            callback(peerList);
-        }
+            dns.resolve(host, (err) => {
+                if (err) {
+                    console.warn(`Tracker DNS resolution failed: ${trackerUrl}`);
+                    resolve(null);
+                } else {
+                    resolve(trackerUrl);
+                }
+            });
+        });
     };
 
-    uniqueTrackers.forEach((trackerUrl: string) => {
-        try {
-            if (trackerUrl.startsWith('udp://')) {
-                discoverUDPPeers(trackerUrl, infoHash, peerId, processTracker);
-            } else {
-                discoverHTTPPeers(trackerUrl, torrent, infoHash, peerId, processTracker);
-            }
-        } catch (err) {
-            console.error(`Tracker discovery error (${trackerUrl}):`, err);
-            processTracker([]); // Ensure we still decrement pendingTrackers
+    // Validate trackers with concurrent DNS checks
+    Promise.all(
+        [...new Set(trackerSources)]
+            .filter(url => url.startsWith('http://') || url.startsWith('https://') || url.startsWith('udp://'))
+            .map(validateTracker)
+    ).then(validatedTrackers => {
+        const filteredTrackers = validatedTrackers.filter((tracker): tracker is string => tracker !== null);
+
+        if (filteredTrackers.length === 0) {
+            console.error("No valid trackers found.");
+            return callback([]);
         }
+
+        const infoHash = Buffer.from(torrent.infoHash, 'hex');
+        const peerId = Buffer.from('-TS0001-' + crypto.randomBytes(6).toString('hex'));
+        
+        let peerList: Peer[] = [];
+        let pendingTrackers = filteredTrackers.length;
+
+        // Track which trackers have been fully processed
+        const processTracker = (trackerPeers: Peer[]) => {
+            peerList = peerList.concat(trackerPeers);
+            pendingTrackers--;
+    
+            if (pendingTrackers === 0) {
+                const uniquePeers = Array.from(
+                    new Set(peerList.map(p => `${p.ip}:${p.port}`))
+                ).map(peer => {
+                    const [ip, port] = peer.split(':');
+                    return { ip, port: parseInt(port) };
+                });
+    
+                console.log(`Total unique peers discovered: ${uniquePeers.length}`);
+                callback(uniquePeers);
+            }
+        };
+
+        filteredTrackers.forEach((trackerUrl: string) => {
+            try {
+                if (trackerUrl.startsWith('udp://')) {
+                    discoverUDPPeers(trackerUrl, infoHash, peerId, processTracker);
+                } else {
+                    discoverHTTPPeers(trackerUrl, torrent, infoHash, peerId, processTracker);
+                }
+            } catch (err) {
+                console.error(`Tracker discovery error (${trackerUrl}):`, err);
+                processTracker([]); // Ensure we still decrement pendingTrackers
+            }
+        });
     });
 }
 
+// Existing UDP and HTTP discovery functions remain the same as in the previous implementation
+// ... (rest of the code remains unchanged)
 // Full UDP Tracker Discovery Function (the entire implementation from previous response goes here)
 
 export function discoverUDPPeers(
@@ -107,7 +144,8 @@ export function discoverUDPPeers(
     socket.send(connectRequest, 0, connectRequest.length, port, host, (err) => {
         if (err) {
             clearTimeout(timeout);
-            console.error('UDP Tracker connection error:', err);
+            // console.error('UDP Tracker connection error:', err);
+
             socket.close();
             callback([]);
         }
@@ -141,7 +179,7 @@ export function discoverUDPPeers(
                     // Send announce request
                     socket.send(announceRequest, 0, announceRequest.length, port, host, (err) => {
                         if (err) {
-                            console.error('UDP Announce request error:', err);
+                            // console.error('UDP Announce request error:', err);
                         }
                     });
                     break;
@@ -166,7 +204,7 @@ export function discoverUDPPeers(
 
                 case ACTIONS.ERROR:
                     const errorMessage = msg.slice(8).toString('utf8');
-                    console.error('UDP Tracker error:', errorMessage);
+                    // console.error('UDP Tracker error:', errorMessage);
                     socket.close();
                     callback([]);
                     break;
@@ -177,7 +215,7 @@ export function discoverUDPPeers(
                     callback([]);
             }
         } catch (error) {
-            console.error('Error processing UDP tracker response:', error);
+            // console.error('Error processing UDP tracker response:', error);
             socket.close();
             callback([]);
         }
@@ -186,7 +224,7 @@ export function discoverUDPPeers(
     // Handle socket errors
     socket.on('error', (err) => {
         clearTimeout(timeout);
-        console.error('UDP Socket error:', err);
+        // console.error('UDP Socket error:', err);
         socket.close();
         callback([]);
     });
@@ -311,7 +349,7 @@ async function discoverHTTPPeers(
         const peers = parseHTTPResponse(Buffer.from(response.data));
         callback(peers);
     } catch (err) {
-        console.error(`HTTP Tracker error:`, err);
+        // console.error(`HTTP Tracker error:`, err);
         callback([]);
     }
 }
